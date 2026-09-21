@@ -7,6 +7,7 @@ Veri ayarlari `.env` dosyasindan okunur:
 ```text
 LTSM_SYMBOL=SPY
 LTSM_FORCE_DOWNLOAD=false
+LTSM_SEEDS=42,1337,2026
 ```
 
 Yahoo Finance/yfinance bu veri icin token gerektirmez. Ham veri `outputs/_cache` klasorune kaydedilir; cache dosyasi varsa tekrar indirilmez. Veriyi zorla yenilemek icin `.env` icinde `LTSM_FORCE_DOWNLOAD=true` yapin.
@@ -50,6 +51,7 @@ Her periyot icin ayri klasor olusur:
 Modeller ayni train/validation/test ayrimi, ayni ozellik seti ve ayni test datasiyla karsilastirilir. Early stopping, gradient clipping ve validation loss tabanli en iyi model kaydi aktiftir.
 Learning rate icin `ReduceLROnPlateau` callback'i kullanilir; `lr_patience`, `lr_factor` ve `min_learning_rate` ayarlari `ltsm_config.py` icindedir. Egitim grafiginde loss degerleriyle birlikte learning rate degisimi de kaydedilir.
 Egitim ilerleme ciktilari `verbose` ile kontrol edilir: `0` sessiz, `1` ozet, `2` her epoch. Validation tahminleri ve metrikleri test metriklerinden ayri olarak kaydedilir.
+Her model `LTSM_SEEDS` listesindeki seed'ler ile tekrar egitilir. Seed bazli metrikler ve mean/std aggregate metrikleri ayri kaydedilir. Metrikler R2, MAE, MSE, RMSE, MAPE ve SMAPE degerlerini icerir; egitim suresi ve model dosya boyutu da raporlanir.
 
 Makale/raporlama icin ek model dokumantasyonu da uretilir:
 
@@ -64,10 +66,13 @@ Makale/raporlama icin ek model dokumantasyonu da uretilir:
 Validation/test raporlari:
 
 - `validation_predictions_<periyot>.csv`: validation datasindaki tahminler
-- `validation_metrics_<periyot>.csv`: validation R2, MAE, MSE, RMSE metrikleri
+- `validation_predictions_aggregate_<periyot>.csv`: seed ortalamali validation tahminleri
+- `validation_metrics_<periyot>.csv`: seed bazli validation R2, MAE, MSE, RMSE, MAPE, SMAPE metrikleri
 - `test_predictions_<periyot>.csv`: test datasindaki tahminler
-- `metrics_<periyot>.csv`: test R2, MAE, MSE, RMSE metrikleri
+- `test_predictions_aggregate_<periyot>.csv`: seed ortalamali test tahminleri
+- `metrics_<periyot>.csv`: seed bazli test R2, MAE, MSE, RMSE, MAPE, SMAPE metrikleri
 - `all_metrics_<periyot>.csv`: validation ve test metrikleri tek tabloda
+- `all_metrics_aggregate_<periyot>.csv`: seed tekrarlarinin mean/std ozet tablosu
 
 Veri seti dokumantasyonu:
 

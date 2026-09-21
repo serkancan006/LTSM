@@ -18,6 +18,16 @@ FORCE_DOWNLOAD = os.getenv("LTSM_FORCE_DOWNLOAD", "false").strip().lower() in {"
 RANDOM_SEED = 42
 
 
+def _parse_seed_list(value: str | None) -> tuple[int, ...]:
+    if not value:
+        return (42, 1337, 2026)
+    seeds = tuple(int(item.strip()) for item in value.split(",") if item.strip())
+    return seeds or (42, 1337, 2026)
+
+
+EXPERIMENT_SEEDS = _parse_seed_list(os.getenv("LTSM_SEEDS"))
+
+
 @dataclass(frozen=True)
 class HorizonConfig:
     name: str
@@ -34,6 +44,7 @@ class HorizonConfig:
     min_learning_rate: float = 1e-6
     forecast_steps: int = 1
     verbose: int = 1
+    seeds: tuple[int, ...] = EXPERIMENT_SEEDS
 
     @property
     def output_dir(self) -> Path:

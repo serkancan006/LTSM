@@ -27,6 +27,8 @@ from training import (
     train_model,
 )
 
+METRIC_COLUMNS = ["r2", "mae", "mse", "rmse", "mape", "smape"]
+
 
 def build_models(input_size: int) -> dict[str, torch.nn.Module]:
     return {
@@ -47,13 +49,53 @@ def build_models(input_size: int) -> dict[str, torch.nn.Module]:
     }
 
 
+def aggregate_metric_frame(metrics: pd.DataFrame) -> pd.DataFrame:
+    aggregate_columns = {
+        "parameters": ["first"],
+        "epochs_ran": ["mean", "std"],
+        "best_val_loss": ["mean", "std"],
+        "training_seconds": ["mean", "std"],
+        "model_size_mb": ["mean", "std"],
+    }
+    for metric in METRIC_COLUMNS:
+        aggregate_columns[metric] = ["mean", "std"]
+
+    aggregate = metrics.groupby(["model", "split"], as_index=False).agg(aggregate_columns)
+    aggregate.columns = [
+        "_".join(part for part in column if part)
+        if isinstance(column, tuple)
+        else column
+        for column in aggregate.columns
+    ]
+    aggregate = aggregate.rename(columns={"model_": "model", "split_": "split", "parameters_first": "parameters"})
+    return aggregate
+
+
+def aggregate_prediction_frames(predictions: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    aggregated = (
+        predictions.groupby(["model", "date"], as_index=False)
+        .agg(actual=("actual", "first"), prediction=("prediction", "mean"), prediction_std=("prediction", "std"))
+        .sort_values(["model", "date"])
+    )
+    return {
+        model_name: frame.drop(columns=["model"]).reset_index(drop=True)
+        for model_name, frame in aggregated.groupby("model")
+    }
+
+
+def metric_plot_frame(aggregate_metrics: pd.DataFrame, split: str) -> pd.DataFrame:
+    frame = aggregate_metrics[aggregate_metrics["split"] == split].copy()
+    rename_map = {f"{metric}_mean": metric for metric in METRIC_COLUMNS}
+    return frame.rename(columns=rename_map)
+
+
 def run_experiment(horizon: str) -> None:
     if horizon not in HORIZON_CONFIGS:
         valid = ", ".join(HORIZON_CONFIGS)
         raise ValueError(f"Bilinmeyen horizon: {horizon}. Gecerli degerler: {valid}")
 
-    seed_everything()
     config = HORIZON_CONFIGS[horizon]
+    seed_everything(config.seeds[0])
     paths = ensure_output_dirs(config.output_dir)
     device = get_device()
 
@@ -82,81 +124,125 @@ def run_experiment(horizon: str) -> None:
     print(f"[{config.name}] Parametre sayilari: {parameter_report}")
 
     train_results = {}
-    prediction_frames = {}
-    validation_prediction_frames = {}
+    test_prediction_rows = []
+    validation_prediction_rows = []
     metric_rows = []
     validation_metric_rows = []
 
-    for model_name, model in models.items():
-        print(f"[{config.name}] {model_name} egitiliyor...")
-        try:
-            result = train_model(model, model_name, loaders, config, paths, device)
-            train_results[model_name] = result
+    for seed in config.seeds:
+        seed_everything(seed)
+        seed_models = build_models(input_size=len(FEATURE_COLUMNS))
+        for model_name, model in seed_models.items():
+            print(f"[{config.name}] {model_name} egitiliyor... seed={seed}")
+            try:
+                result = train_model(model, model_name, loaders, config, paths, device, seed=seed)
+                train_results[f"{model_name}_seed{seed}"] = result
 
-            validation_predictions = predict(result["model"], loaders["val"], scalers["target"], device)
-            validation_predictions["model"] = model_name
-            validation_prediction_frames[model_name] = validation_predictions
+                validation_predictions = predict(result["model"], loaders["val"], scalers["target"], device)
+                validation_predictions["model"] = model_name
+                validation_predictions["seed"] = seed
+                validation_prediction_rows.append(validation_predictions)
 
-            predictions = predict(result["model"], loaders["test"], scalers["target"], device)
-            predictions["model"] = model_name
-            prediction_frames[model_name] = predictions
+                predictions = predict(result["model"], loaders["test"], scalers["target"], device)
+                predictions["model"] = model_name
+                predictions["seed"] = seed
+                test_prediction_rows.append(predictions)
 
-            validation_metrics = evaluate_predictions(validation_predictions)
-            validation_metrics.update(
-                {
-                    "model": model_name,
-                    "split": "validation",
+                shared_metadata = {
                     "parameters": result["parameters"],
                     "epochs_ran": result["epochs_ran"],
                     "best_val_loss": result["best_val_loss"],
+                    "training_seconds": result["training_seconds"],
+                    "model_size_mb": result["model_size_mb"],
+                    "model_path": result["model_path"],
+                    "seed": seed,
                 }
-            )
-            validation_metric_rows.append(validation_metrics)
 
-            metrics = evaluate_predictions(predictions)
-            metrics.update(
-                {
-                    "model": model_name,
-                    "split": "test",
-                    "parameters": result["parameters"],
-                    "epochs_ran": result["epochs_ran"],
-                    "best_val_loss": result["best_val_loss"],
-                }
-            )
-            metric_rows.append(metrics)
-        except RuntimeError as exc:
-            if "out of memory" in str(exc).lower() and torch.cuda.is_available():
-                torch.cuda.empty_cache()
-            error_path = paths["reports"] / f"error_{model_name}_{config.name}.txt"
-            error_path.write_text(str(exc), encoding="utf-8")
-            raise
+                validation_metrics = evaluate_predictions(validation_predictions)
+                validation_metrics.update({"model": model_name, "split": "validation", **shared_metadata})
+                validation_metric_rows.append(validation_metrics)
+
+                metrics = evaluate_predictions(predictions)
+                metrics.update({"model": model_name, "split": "test", **shared_metadata})
+                metric_rows.append(metrics)
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower() and torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                error_path = paths["reports"] / f"error_{model_name}_{config.name}_seed{seed}.txt"
+                error_path.write_text(str(exc), encoding="utf-8")
+                raise
+            finally:
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
     validation_metrics_frame = pd.DataFrame(validation_metric_rows)
     validation_metrics_frame = validation_metrics_frame[
-        ["model", "split", "parameters", "epochs_ran", "best_val_loss", "r2", "mae", "mse", "rmse"]
+        [
+            "model",
+            "split",
+            "seed",
+            "parameters",
+            "epochs_ran",
+            "best_val_loss",
+            "training_seconds",
+            "model_size_mb",
+            "model_path",
+            *METRIC_COLUMNS,
+        ]
     ]
     validation_metrics_frame.to_csv(paths["reports"] / f"validation_metrics_{config.name}.csv", index=False)
 
     metrics_frame = pd.DataFrame(metric_rows)
     metrics_frame = metrics_frame[
-        ["model", "split", "parameters", "epochs_ran", "best_val_loss", "r2", "mae", "mse", "rmse"]
+        [
+            "model",
+            "split",
+            "seed",
+            "parameters",
+            "epochs_ran",
+            "best_val_loss",
+            "training_seconds",
+            "model_size_mb",
+            "model_path",
+            *METRIC_COLUMNS,
+        ]
     ]
     metrics_frame.to_csv(paths["reports"] / f"metrics_{config.name}.csv", index=False)
 
     all_metrics_frame = pd.concat([validation_metrics_frame, metrics_frame], ignore_index=True)
     all_metrics_frame.to_csv(paths["reports"] / f"all_metrics_{config.name}.csv", index=False)
+    aggregate_metrics_frame = aggregate_metric_frame(all_metrics_frame)
+    aggregate_metrics_frame.to_csv(paths["reports"] / f"all_metrics_aggregate_{config.name}.csv", index=False)
 
-    combined_validation_predictions = pd.concat(validation_prediction_frames.values(), ignore_index=True)
+    combined_validation_predictions = pd.concat(validation_prediction_rows, ignore_index=True)
     combined_validation_predictions.to_csv(
         paths["reports"] / f"validation_predictions_{config.name}.csv", index=False
     )
+    aggregate_validation_predictions_by_model = aggregate_prediction_frames(combined_validation_predictions)
+    aggregate_validation_predictions = pd.concat(
+        aggregate_validation_predictions_by_model.values(),
+        keys=aggregate_validation_predictions_by_model.keys(),
+        names=["model"],
+    ).reset_index(level=0)
+    aggregate_validation_predictions.to_csv(
+        paths["reports"] / f"validation_predictions_aggregate_{config.name}.csv", index=False
+    )
 
-    combined_predictions = pd.concat(prediction_frames.values(), ignore_index=True)
+    combined_predictions = pd.concat(test_prediction_rows, ignore_index=True)
     combined_predictions.to_csv(paths["reports"] / f"test_predictions_{config.name}.csv", index=False)
+    aggregate_prediction_frames_by_model = aggregate_prediction_frames(combined_predictions)
+    aggregate_test_predictions = pd.concat(
+        aggregate_prediction_frames_by_model.values(),
+        keys=aggregate_prediction_frames_by_model.keys(),
+        names=["model"],
+    ).reset_index(level=0)
+    aggregate_test_predictions.to_csv(
+        paths["reports"] / f"test_predictions_aggregate_{config.name}.csv", index=False
+    )
 
     plot_training_history(train_results, config, paths)
-    plot_predictions(prediction_frames, config, paths)
-    plot_metric_comparison(metrics_frame, config, paths)
+    plot_predictions(aggregate_prediction_frames_by_model, config, paths)
+    plot_metric_comparison(metric_plot_frame(aggregate_metrics_frame, "test"), config, paths)
 
     summary = {
         "symbol": SYMBOL,
@@ -167,6 +253,7 @@ def run_experiment(horizon: str) -> None:
         "validation_metrics": validation_metrics_frame.to_dict(orient="records"),
         "test_metrics": metrics_frame.to_dict(orient="records"),
         "all_metrics": all_metrics_frame.to_dict(orient="records"),
+        "aggregate_metrics": aggregate_metrics_frame.to_dict(orient="records"),
         "outputs": {name: str(path) for name, path in paths.items()},
     }
     with (paths["reports"] / f"summary_{config.name}.json").open("w", encoding="utf-8") as file:

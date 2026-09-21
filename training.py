@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import json
 import random
+import time
 from dataclasses import asdict
 from pathlib import Path
 
@@ -26,7 +27,8 @@ def seed_everything(seed: int = RANDOM_SEED) -> None:
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
+    torch.backends.cudnn.deterministic = True
 
 
 def get_device() -> torch.device:
@@ -137,7 +139,9 @@ def train_model(
     config: HorizonConfig,
     paths: dict[str, Path],
     device: torch.device,
+    seed: int,
 ) -> dict[str, object]:
+    started_at = time.perf_counter()
     model = model.to(device)
     criterion = nn.MSELoss()
     optimizer = torch.optim.AdamW(
@@ -199,12 +203,13 @@ def train_model(
                     "model_state_dict": best_state,
                     "config": asdict(config),
                     "model_name": model_name,
+                    "seed": seed,
                     "symbol": SYMBOL,
                     "feature_columns": FEATURE_COLUMNS,
                     "parameter_count": count_parameters(model),
                     "best_val_loss": best_val_loss,
                 },
-                paths["models"] / f"{model_name}_{config.name}.pt",
+                paths["models"] / f"{model_name}_{config.name}_seed{seed}.pt",
             )
         else:
             wait += 1
@@ -215,6 +220,7 @@ def train_model(
             current_lr = optimizer.param_groups[0]["lr"]
             print(
                 f"[{config.name}] {model_name} epoch {epoch:03d}/{config.epochs} "
+                f"seed={seed} "
                 f"train_loss={train_loss:.6f} val_loss={val_loss:.6f} "
                 f"lr={current_lr:.2e} early_stop_wait={wait}/{config.patience}"
             )
@@ -228,7 +234,10 @@ def train_model(
             break
 
     model.load_state_dict(best_state)
-    history_path = paths["reports"] / f"history_{model_name}_{config.name}.json"
+    training_seconds = float(time.perf_counter() - started_at)
+    model_path = paths["models"] / f"{model_name}_{config.name}_seed{seed}.pt"
+    model_size_mb = model_path.stat().st_size / (1024 * 1024) if model_path.exists() else 0.0
+    history_path = paths["reports"] / f"history_{model_name}_{config.name}_seed{seed}.json"
     with history_path.open("w", encoding="utf-8") as file:
         json.dump(history, file, indent=2)
 
@@ -238,6 +247,10 @@ def train_model(
         "best_val_loss": best_val_loss,
         "epochs_ran": len(history["train_loss"]),
         "parameters": count_parameters(model),
+        "seed": seed,
+        "training_seconds": training_seconds,
+        "model_path": str(model_path),
+        "model_size_mb": float(model_size_mb),
     }
 
 
@@ -270,11 +283,16 @@ def evaluate_predictions(predictions: pd.DataFrame) -> dict[str, float]:
     actual = predictions["actual"].to_numpy()
     pred = predictions["prediction"].to_numpy()
     mse = mean_squared_error(actual, pred)
+    epsilon = np.finfo(float).eps
+    mape = np.mean(np.abs((actual - pred) / np.maximum(np.abs(actual), epsilon))) * 100
+    smape = np.mean(2 * np.abs(pred - actual) / np.maximum(np.abs(actual) + np.abs(pred), epsilon)) * 100
     return {
         "r2": float(r2_score(actual, pred)),
         "mae": float(mean_absolute_error(actual, pred)),
         "mse": float(mse),
         "rmse": float(np.sqrt(mse)),
+        "mape": float(mape),
+        "smape": float(smape),
     }
 
 
@@ -316,8 +334,8 @@ def plot_predictions(prediction_frames: dict[str, pd.DataFrame], config: Horizon
 
 
 def plot_metric_comparison(metrics: pd.DataFrame, config: HorizonConfig, paths: dict[str, Path]) -> None:
-    metric_columns = ["r2", "mae", "mse", "rmse"]
-    fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+    metric_columns = ["r2", "mae", "mse", "rmse", "mape", "smape"]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 8))
     for ax, metric in zip(axes.ravel(), metric_columns):
         ax.bar(metrics["model"], metrics[metric], color=["#1f6f8b", "#c44900"])
         ax.set_title(metric.upper())
